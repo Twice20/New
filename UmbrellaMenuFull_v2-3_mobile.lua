@@ -1025,54 +1025,118 @@ local function trim(s) return (s:gsub("^%s+", ""):gsub("%s+$", "")) end
 
 local function parseLyrics(text, duration)
 	text = text:gsub("\r\n", "\n"):gsub("\r", "\n")
+
 	local timed, plain = {}, {}
 	local anyTimed = false
+	local section = nil
+
+	-- Заголовки секций песни. Они не показываются как субтитры,
+	-- но используются как границы между частями песни.
+	local sectionNames = {
+		"интро", "аутро", "куплет", "припев", "предприпев", "бридж",
+		"переход", "рефрен", "постприпев", "пост%-припев", "verse",
+		"chorus", "pre%-chorus", "bridge", "intro", "outro", "hook",
+		"послесловие"
+	}
+
+	local function isSectionHeader(ln)
+		local inside = ln:match("^%[([^%]]+)%]$")
+		if not inside then return false end
+		local low = inside:lower():gsub("^%s+", ""):gsub("%s+$", "")
+		if low:match("^текст песни") or low:match("^lyrics") then return true end
+		for _, name in ipairs(sectionNames) do
+			if low:match("^" .. name) then
+				return true
+			end
+		end
+		return false
+	end
+
+	local function isMetadata(ln)
+		local low = ln:lower()
+		return low:match("^lyrics%s*$")
+			or low:match("^about%s*$")
+			or low:match("^comments%s*$")
+			or low:match("^sign up%s*$")
+			or low:match("^lucky daye")
+			or low:match("^%d+[,.]?%d*k?$")
+			or low:match("^%d+%s*$")
+	end
+
 	for raw in (text .. "\n"):gmatch("(.-)\n") do
 		local ln = trim(raw)
-		-- пропускаем теги вида [ar:Artist], [Припев], [Verse 1]
-		if ln ~= "" and not ln:match("^%[%D*%]$") then
-			local times, rest = {}, ln
-			while true do
-				local m, s, f, after = rest:match("^%[(%d+):(%d+)[%.:]?(%d*)%]%s*(.*)$")
-				if not m then break end
-				local t = tonumber(m) * 60 + tonumber(s) + ((f ~= "") and (tonumber("0." .. f) or 0) or 0)
-				table.insert(times, t)
-				rest = after
-			end
-			if #times == 0 then
-				local m, s, after = rest:match("^(%d+):(%d%d)%s+(.+)$")
-				if m then
-					table.insert(times, tonumber(m) * 60 + tonumber(s))
+
+		if ln ~= "" and not isMetadata(ln) then
+			if isSectionHeader(ln) then
+				section = ln:sub(2, -2)
+			else
+				local times, rest = {}, ln
+
+				-- Поддержка LRC: [01:23.45] Текст
+				while true do
+					local m, ss, f, after = rest:match("^%[(%d+):(%d+)[%.:]?(%d*)%]%s*(.*)$")
+					if not m then break end
+					local frac = (f ~= "") and (tonumber("0." .. f) or 0) or 0
+					table.insert(times, tonumber(m) * 60 + tonumber(ss) + frac)
 					rest = after
 				end
-			end
-			if #times > 0 then
-				anyTimed = true
-				for _, t in ipairs(times) do table.insert(timed, { t, trim(rest) }) end
-			elseif anyTimed and #timed > 0 then
-				-- строка без таймкода после строки с таймкодом - продолжение предыдущей
-				local last = timed[#timed]
-				last[2] = (last[2] ~= "" and (last[2] .. " ") or "") .. ln
-			else
-				table.insert(plain, ln)
+
+				-- Формат 01:23 текст
+				if #times == 0 then
+					local m, ss, after = rest:match("^(%d+):(%d%d)%s+(.+)$")
+					if m then
+						table.insert(times, tonumber(m) * 60 + tonumber(ss))
+						rest = after
+					end
+				end
+
+				if #times > 0 then
+					anyTimed = true
+					for _, t in ipairs(times) do
+						local line = trim(rest)
+						if line ~= "" then
+							table.insert(timed, { t, line, section })
+						end
+					end
+				elseif anyTimed and #timed > 0 then
+					-- Перенос строки после LRC остаётся продолжением текущей строки.
+					local last = timed[#timed]
+					last[2] = (last[2] ~= "" and (last[2] .. " ") or "") .. ln
+				else
+					-- Обычный текст: каждая физическая строка = отдельная строка субтитров.
+					table.insert(plain, { trim(rest), section })
+				end
 			end
 		end
 	end
+
 	if anyTimed then
-		for i, e in ipairs(timed) do e[3] = i end
-		table.sort(timed, function(a, b) if a[1] == b[1] then return a[3] < b[3] end return a[1] < b[1] end)
+		for i, e in ipairs(timed) do e[4] = i end
+		table.sort(timed, function(a, b)
+			if a[1] == b[1] then return a[4] < b[4] end
+			return a[1] < b[1]
+		end)
 		return timed, "timed"
 	end
-	-- без таймкодов: равномерно по длине трека, с весом по длине строки
+
+	-- Без таймкодов: автоматически распределяем строки по длине трека.
+	-- Заголовки [Куплет]/[Припев] дают небольшую паузу между секциями,
+	-- а длинные строки получают немного больше времени на экране.
 	local weights, total = {}, 0
-	for i, l in ipairs(plain) do
+	for i, item in ipairs(plain) do
+		local l = item[1]
 		local w = math.max(utf8.len(l) or #l, 8) + 6
-		weights[i] = w; total += w
+		if i > 1 and item[2] ~= plain[i - 1][2] then
+			w += 4
+		end
+		weights[i] = w
+		total += w
 	end
+
 	local dur = (duration and duration > 1) and duration or math.max(#plain * 3, 120)
 	local out, acc = {}, 0
-	for i, l in ipairs(plain) do
-		out[i] = { acc / total * dur, l }
+	for i, item in ipairs(plain) do
+		out[i] = { acc / math.max(total, 1) * dur, item[1], item[2] }
 		acc += weights[i]
 	end
 	return out, "auto"
